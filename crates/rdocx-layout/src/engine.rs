@@ -1984,25 +1984,32 @@ impl Engine {
         // Build sections: each section has blocks + geometry + header/footer
         let mut sections: Vec<paginator::SharedSection> = Vec::new();
         let mut current_blocks: Vec<SharedLayoutBlock> = Vec::new();
-        let mut current_sect_pr: Option<CT_SectPr> = None; // Will be set from paragraph sect_pr
+        let items = main_story_layout_items(&input.document);
+        // Paragraph sectPr describes the section ending there, not the next
+        // one. Resolve each section's properties before laying out its blocks,
+        // using the same flattened story order as the layout traversal.
+        let mut section_properties = items.iter().filter_map(|item| match item {
+            MainStoryLayoutItem::Paragraph(para, _) => {
+                para.properties.as_ref().and_then(|p| p.sect_pr.as_ref())
+            }
+            MainStoryLayoutItem::Table(_, _) => None,
+        });
+        let mut current_sect_pr = section_properties.next().unwrap_or(&final_sect_pr);
 
-        for content in main_story_layout_items(&input.document) {
+        for content in &items {
             match content {
                 MainStoryLayoutItem::Paragraph(para, path) => {
                     // Check if this paragraph ends a section (has sect_pr)
                     let para_sect_pr = para.properties.as_ref().and_then(|p| p.sect_pr.clone());
 
-                    let sect_pr_for_layout = para_sect_pr
-                        .as_ref()
-                        .or(current_sect_pr.as_ref())
-                        .unwrap_or(&final_sect_pr);
+                    let sect_pr_for_layout = current_sect_pr;
                     let geometry = sect_pr_to_geometry(sect_pr_for_layout);
 
                     let source = sources.and_then(|sources| {
                         if path.len() == 1 {
                             sources.body_id(path[0])
                         } else {
-                            sources.id(&WordStory::Document, &path)
+                            sources.id(&WordStory::Document, path)
                         }
                     });
                     let mut block = self.layout_body_paragraph(
@@ -2088,14 +2095,14 @@ impl Engine {
                             title_pg,
                             page_number_start: section_page_number_start(&sect_pr),
                         });
-                        current_sect_pr = Some(sect_pr);
+                        current_sect_pr = section_properties.next().unwrap_or(&final_sect_pr);
                         if let Some(numbering) = input.numbering.as_ref() {
                             num_state.restart_after_section_break(numbering);
                         }
                     }
                 }
                 MainStoryLayoutItem::Table(tbl, path) => {
-                    let sect_pr_for_layout = current_sect_pr.as_ref().unwrap_or(&final_sect_pr);
+                    let sect_pr_for_layout = current_sect_pr;
                     let geometry = sect_pr_to_geometry(sect_pr_for_layout);
 
                     let mut table_block = self.layout_body_table(
@@ -2108,7 +2115,7 @@ impl Engine {
                         &mut diagnostics,
                         sources,
                         &WordStory::Document,
-                        &path,
+                        path,
                         sect_pr_for_layout.doc_grid.as_deref(),
                     )?;
                     if sources.is_some() {
@@ -17444,6 +17451,91 @@ mod tests {
                         children,
                     }) if children == &[0]
                 ));
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_sections_use_their_own_measure_before_pagination() {
+        // A section's properties occur at its end, including when its blocks
+        // are inside a content control. Compare each section with the same
+        // content laid out alone so both wrapping and pagination are checked.
+        for in_control in [false, true] {
+            let mut input = make_input_with_text("");
+            let mut mixed_body = String::new();
+            let mut expected = Vec::new();
+            for (index, (width, height, left, right)) in [
+                (12240, 15840, 1440, 1440),
+                (15840, 12240, 720, 1080),
+                (12240, 15840, 1800, 2160),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let sect = format!(
+                    "<w:sectPr><w:pgSz w:w=\"{width}\" w:h=\"{height}\"/>\
+                     <w:pgMar w:top=\"1440\" w:bottom=\"1440\" \
+                     w:left=\"{left}\" w:right=\"{right}\"/></w:sectPr>"
+                );
+                let prose =
+                    format!("Section {index} keeps every word within its margins. ").repeat(24);
+                let paragraph = format!("<w:p><w:r><w:t>{prose}</w:t></w:r></w:p>");
+                let table = format!(
+                    "<w:tbl><w:tblPr><w:tblW w:w=\"5000\" w:type=\"pct\"/></w:tblPr>\
+                     <w:tblGrid><w:gridCol w:w=\"0\"/></w:tblGrid><w:tr><w:tc>\
+                     {paragraph}</w:tc></w:tr></w:tbl>"
+                );
+                let blocks = format!("{paragraph}{table}{}", paragraph.repeat(5));
+                let wrap = |body: String| {
+                    if in_control {
+                        format!("<w:sdt><w:sdtContent>{body}</w:sdtContent></w:sdt>")
+                    } else {
+                        body
+                    }
+                };
+                let isolated = format!(
+                    "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+                     <w:body>{}{sect}</w:body></w:document>",
+                    wrap(format!("{blocks}<w:p/>"))
+                );
+                input.document = CT_Document::from_xml(isolated.as_bytes()).expect("section XML");
+                let result = deterministic_layout(&input);
+                assert!(result.pages.len() > 1, "fixture exercises pagination");
+                for page in &result.pages {
+                    assert!(
+                        text_extents(page).iter().all(|(start, end)| {
+                            *start >= f64::from(left) / 20.0 - 0.01
+                                && *end <= f64::from(width - right) / 20.0 + 0.01
+                        }),
+                        "isolated section text fits its margins"
+                    );
+                }
+                expected.extend(result.pages);
+                if index < 2 {
+                    mixed_body.push_str(&wrap(format!("{blocks}<w:p><w:pPr>{sect}</w:pPr></w:p>")));
+                } else {
+                    mixed_body.push_str(&wrap(format!("{blocks}<w:p/>")));
+                    mixed_body.push_str(&sect);
+                }
+            }
+            let xml = format!(
+                "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+                 <w:body>{mixed_body}</w:body></w:document>"
+            );
+            input.document = CT_Document::from_xml(xml.as_bytes()).expect("mixed section XML");
+            let actual = deterministic_layout(&input);
+            assert_eq!(actual.pages.len(), expected.len(), "section pagination");
+            for (page, reference) in actual.pages.iter().zip(&expected) {
+                assert_eq!(
+                    (page.width, page.height),
+                    (reference.width, reference.height)
+                );
+                assert_eq!(
+                    page_text(page),
+                    page_text(reference),
+                    "page text and wrapping"
+                );
+                assert_eq!(text_extents(page), text_extents(reference), "line measure");
             }
         }
     }

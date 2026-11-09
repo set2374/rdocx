@@ -215,6 +215,7 @@ pub(crate) struct SourceRegistry {
     field_source_xml: HashMap<FieldSource, Vec<u8>>,
     field_source_contexts: HashMap<FieldSource, (String, bool, bool)>,
     styleref_requests: HashMap<FieldSource, FieldInstruction>,
+    page_field_instructions: HashMap<FieldSource, FieldInstruction>,
     text_box_owner_indices: HashMap<WordStory, usize>,
     story_part_names: HashMap<WordStory, String>,
     story_owner_children: HashMap<WordStory, Vec<usize>>,
@@ -233,6 +234,7 @@ impl SourceRegistry {
             field_source_xml: HashMap::new(),
             field_source_contexts: HashMap::new(),
             styleref_requests: HashMap::new(),
+            page_field_instructions: HashMap::new(),
             text_box_owner_indices: HashMap::new(),
             story_part_names: input.story_part_names.clone(),
             story_owner_children: HashMap::new(),
@@ -414,6 +416,7 @@ impl SourceRegistry {
             field_source_xml: HashMap::new(),
             field_source_contexts: HashMap::new(),
             styleref_requests: HashMap::new(),
+            page_field_instructions: HashMap::new(),
             text_box_owner_indices: HashMap::new(),
             story_part_names: input.story_part_names.clone(),
             story_owner_children: HashMap::new(),
@@ -662,6 +665,16 @@ impl SourceRegistry {
             let instruction = field.effective_instruction();
             if !locked && !cached && supported_styleref(&instruction) {
                 registry.styleref_requests.insert(source, instruction);
+            } else if !locked
+                && !cached
+                && matches!(
+                    instruction.name.as_str(),
+                    "PAGE" | "NUMPAGES" | "SECTIONPAGES"
+                )
+            {
+                registry
+                    .page_field_instructions
+                    .insert(source, instruction.clone());
             }
             registry
                 .field_source_contexts
@@ -3474,6 +3487,8 @@ struct FieldSubstitutionInputs {
     page_index: usize,
     page_number: usize,
     total_pages: usize,
+    /// Format family of the page's section, so a changed `w:fmt` is not reused.
+    page_format: std::mem::Discriminant<ST_NumberFormat>,
     bookmark_pages: Vec<(usize, usize)>,
     font_identity: Vec<FontId>,
     revision_view: RevisionView,
@@ -4263,6 +4278,7 @@ impl Engine {
                             header_footer_semantics,
                             title_pg,
                             page_number_start: section_page_number_start(sect_pr),
+                            page_number_format: section_page_number_format(sect_pr),
                             endnotes_at_section_end: sect_pr
                                 .endnote_pr
                                 .as_deref()
@@ -4361,6 +4377,7 @@ impl Engine {
             header_footer_semantics: final_hf_semantics,
             title_pg: final_title_pg,
             page_number_start: section_page_number_start(&final_sect_pr),
+            page_number_format: section_page_number_format(&final_sect_pr),
             endnotes_at_section_end: final_sect_pr
                 .endnote_pr
                 .as_deref()
@@ -5037,6 +5054,10 @@ impl Engine {
                 sequence_boundary
             })
             .collect::<Vec<_>>();
+        let section_page_formats = sections
+            .iter()
+            .map(|section| section.page_number_format.clone())
+            .collect::<Vec<_>>();
         let mut substitution_inputs = Vec::with_capacity(pages.len());
         let mut reuse_result_pages = vec![false; pages.len()];
         for (page_index, page) in pages.iter_mut().enumerate() {
@@ -5057,6 +5078,13 @@ impl Engine {
                 page_index,
                 page_number: page.displayed_page_number,
                 total_pages,
+                page_format: std::mem::discriminant(
+                    self.last_page_sections
+                        .iter()
+                        .find(|record| record.physical_page == page.page_number)
+                        .and_then(|record| section_page_formats.get(record.section_index))
+                        .unwrap_or(&ST_NumberFormat::Decimal),
+                ),
                 bookmark_pages: bookmark_identity.clone(),
                 font_identity: font_trace.clone(),
                 revision_view: input.revision_view,
@@ -5117,6 +5145,10 @@ impl Engine {
                 total_pages,
                 (section_index + 1, section_pages),
                 &field_sections,
+                &PageFieldFormats {
+                    sections: &section_page_formats,
+                    instructions: sources.map(|registry| &registry.page_field_instructions),
+                },
                 &bookmark_pages,
                 input.sequence_snapshot.as_deref(),
                 sequence_boundaries[page_index],
@@ -8414,6 +8446,34 @@ fn sequence_repeat_display(
 ///
 /// Text aligned on a right, centre or decimal tab stop is then moved so it
 /// stays on its stop with the value in place of the placeholder.
+/// What the page-number family of fields needs to pick a display format.
+struct PageFieldFormats<'a> {
+    /// `w:pgNumType w:fmt` of each section, by section index.
+    sections: &'a [ST_NumberFormat],
+    /// Instructions (for `\*` switches) of the PAGE-family fields in the source.
+    instructions: Option<&'a HashMap<FieldSource, FieldInstruction>>,
+}
+
+impl PageFieldFormats<'_> {
+    fn text(
+        &self,
+        kind: FieldKind,
+        value: usize,
+        section_number: usize,
+        source: Option<FieldSource>,
+    ) -> String {
+        let section_format = match kind {
+            FieldKind::Page => section_number
+                .checked_sub(1)
+                .and_then(|index| self.sections.get(index))
+                .unwrap_or(&ST_NumberFormat::Decimal),
+            _ => &ST_NumberFormat::Decimal,
+        };
+        let instruction = source.and_then(|source| self.instructions?.get(&source));
+        page_field_text(value, section_format, instruction)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn substitute_fields(
     elements: &mut Vec<PositionedElement>,
@@ -8421,6 +8481,7 @@ fn substitute_fields(
     total_pages: usize,
     section_values: (usize, usize),
     field_sections: &HashMap<FieldSource, (usize, usize, usize)>,
+    formats: &PageFieldFormats<'_>,
     bookmark_pages: &HashMap<usize, usize>,
     sequence: Option<&crate::WordSequenceSnapshot>,
     sequence_boundary: usize,
@@ -8433,6 +8494,7 @@ fn substitute_fields(
         total_pages,
         section_values,
         field_sections,
+        formats,
         bookmark_pages,
         sequence,
         sequence_boundary,
@@ -8639,6 +8701,7 @@ fn substitute_field_values(
     total_pages: usize,
     section_values: (usize, usize),
     field_sections: &HashMap<FieldSource, (usize, usize, usize)>,
+    formats: &PageFieldFormats<'_>,
     bookmark_pages: &HashMap<usize, usize>,
     sequence: Option<&crate::WordSequenceSnapshot>,
     sequence_boundary: usize,
@@ -8657,10 +8720,16 @@ fn substitute_field_values(
                     .copied()
                     .unwrap_or((section_values.0, section_values.1, page_number));
                 let value = match fk {
-                    FieldKind::Page => section_values.2.to_string(),
-                    FieldKind::NumPages => total_pages.to_string(),
+                    FieldKind::Page => {
+                        formats.text(fk, section_values.2, section_values.0, run.field_source)
+                    }
+                    FieldKind::NumPages => {
+                        formats.text(fk, total_pages, section_values.0, run.field_source)
+                    }
                     FieldKind::Section => section_values.0.to_string(),
-                    FieldKind::SectionPages => section_values.1.to_string(),
+                    FieldKind::SectionPages => {
+                        formats.text(fk, section_values.1, section_values.0, run.field_source)
+                    }
                     FieldKind::TargetPage(target) => {
                         let Some(page) = bookmark_pages.get(&target) else {
                             run.field_kind = None;
@@ -8711,10 +8780,16 @@ fn substitute_field_values(
                     .copied()
                     .unwrap_or((section_values.0, section_values.1, page_number));
                 let value = match fk {
-                    FieldKind::Page => section_values.2.to_string(),
-                    FieldKind::NumPages => total_pages.to_string(),
+                    FieldKind::Page => {
+                        formats.text(fk, section_values.2, section_values.0, run.field_source)
+                    }
+                    FieldKind::NumPages => {
+                        formats.text(fk, total_pages, section_values.0, run.field_source)
+                    }
                     FieldKind::Section => section_values.0.to_string(),
-                    FieldKind::SectionPages => section_values.1.to_string(),
+                    FieldKind::SectionPages => {
+                        formats.text(fk, section_values.1, section_values.0, run.field_source)
+                    }
                     FieldKind::TargetPage(target) => {
                         let Some(page) = bookmark_pages.get(&target) else {
                             run.field_kind = None;
@@ -8788,6 +8863,7 @@ fn substitute_field_values(
                 total_pages,
                 section_values,
                 field_sections,
+                formats,
                 bookmark_pages,
                 sequence,
                 sequence_boundary,
@@ -8799,6 +8875,7 @@ fn substitute_field_values(
                 total_pages,
                 section_values,
                 field_sections,
+                formats,
                 bookmark_pages,
                 sequence,
                 sequence_boundary,
@@ -12219,6 +12296,49 @@ fn section_page_number_start(sect_pr: &CT_SectPr) -> Option<usize> {
         .as_ref()?
         .start
         .map(|value| value as usize)
+}
+
+fn section_page_number_format(sect_pr: &CT_SectPr) -> ST_NumberFormat {
+    sect_pr
+        .page_number
+        .as_ref()
+        .and_then(|page_number| page_number.format.clone())
+        .unwrap_or(ST_NumberFormat::Decimal)
+}
+
+/// Text of a PAGE-family field. A `\* roman`, `\* ROMAN`, `\* alphabetic`,
+/// `\* ALPHABETIC` or `\* arabic` switch wins over the section's `w:pgNumType`
+/// format, as in Word. Formats the renderer has no algorithm for stay decimal.
+fn page_field_text(
+    value: usize,
+    section_format: &ST_NumberFormat,
+    instruction: Option<&FieldInstruction>,
+) -> String {
+    let decimal = value.to_string();
+    if let Some(instruction) = instruction {
+        let numeric_switch = instruction.switches.iter().any(|switch| {
+            switch.name == "*"
+                && matches!(&switch.argument, Some(FieldArgument::Text(format))
+                    if ["roman", "alphabetic", "arabic"].iter().any(|known| format.eq_ignore_ascii_case(known)))
+        });
+        if numeric_switch && let Ok(text) = format_numeric_field_general(instruction, &decimal) {
+            return text;
+        }
+    }
+    let formatted = u32::try_from(value)
+        .ok()
+        .filter(|value| *value > 0)
+        .and_then(|value| {
+            match section_format {
+                ST_NumberFormat::UpperRoman => roman(value, true),
+                ST_NumberFormat::LowerRoman => roman(value, false),
+                ST_NumberFormat::UpperLetter => page_alphabetic(value, true),
+                ST_NumberFormat::LowerLetter => page_alphabetic(value, false),
+                _ => return None,
+            }
+            .ok()
+        });
+    formatted.unwrap_or(decimal)
 }
 
 fn xml_local_name(name: &[u8]) -> &[u8] {
@@ -21771,6 +21891,7 @@ mod tests {
                         page_index: 0,
                         page_number: 1,
                         total_pages: 1,
+                        page_format: std::mem::discriminant(&ST_NumberFormat::Decimal),
                         bookmark_pages: if nested == "bookmark targets" {
                             Vec::with_capacity(over_limit::<(usize, usize)>())
                         } else {

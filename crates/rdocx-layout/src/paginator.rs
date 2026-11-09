@@ -272,6 +272,7 @@ pub(crate) struct SharedSection {
     pub header_footer_semantics: Option<HeaderFooterSemantics>,
     pub title_pg: bool,
     pub page_number_start: Option<usize>,
+    pub page_number_format: rdocx_oxml::numbering::ST_NumberFormat,
     pub endnotes_at_section_end: bool,
     pub footnotes_beneath_text: bool,
 }

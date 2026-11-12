@@ -36481,3 +36481,80 @@ fn checked_body_insertions_refuse_unsavable_namespace_owners_atomically() {
     }));
     assert!(panicked.is_err(), "legacy insert still panics past the end");
 }
+
+/// Displayed PAGE= value of each page of `bytes`, text up to the first space.
+fn page_field_labels(bytes: &[u8]) -> Vec<String> {
+    let document = Document::from_bytes(bytes).unwrap();
+    document
+        .layout_deterministic()
+        .unwrap()
+        .layout
+        .pages
+        .iter()
+        .map(|page| {
+            let mut text = String::new();
+            oxml_layout::walk(&page.elements, &mut |element, _| {
+                if let oxml_layout::PositionedElement::Text(run) = element {
+                    text.push_str(&run.text);
+                }
+            });
+            let value = text.split_once("PAGE=").unwrap().1;
+            // The page body text follows the header text.
+            ["first", "second", "third"]
+                .iter()
+                .find_map(|body| value.find(body))
+                .map_or(value, |end| &value[..end])
+                .to_owned()
+        })
+        .collect()
+}
+
+fn patch_oracle_package(patch: impl FnOnce(&mut OpcPackage)) -> Vec<u8> {
+    let mut package = OpcPackage::from_reader(std::io::Cursor::new(
+        f251_section_oracle_source().to_bytes().unwrap(),
+    ))
+    .unwrap();
+    patch(&mut package);
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    package.write_to(&mut bytes).unwrap();
+    bytes.into_inner()
+}
+
+#[test]
+fn page_fields_display_in_the_section_page_number_format() {
+    // Sections restart at 1, 12 and 27; Word prints i, XII and aa.
+    let bytes = patch_oracle_package(|package| {
+        let xml = std::str::from_utf8(package.get_part("/word/document.xml").unwrap())
+            .unwrap()
+            .to_owned();
+        let mut formats = ["lowerRoman", "upperRoman", "lowerLetter"].into_iter();
+        let mut patched = String::new();
+        for (index, piece) in xml.split("<w:pgNumType ").enumerate() {
+            if index > 0 {
+                patched.push_str(&format!(
+                    "<w:pgNumType w:fmt=\"{}\" ",
+                    formats.next().unwrap()
+                ));
+            }
+            patched.push_str(piece);
+        }
+        assert!(
+            formats.next().is_none(),
+            "expected three pgNumType elements: {xml}"
+        );
+        package.set_part("/word/document.xml", patched.into_bytes());
+    });
+    assert_eq!(page_field_labels(&bytes), ["i", "XII", "aa"]);
+}
+
+#[test]
+fn a_page_field_roman_switch_overrides_the_section_format() {
+    let header_part = "/word/header1.xml";
+    let bytes = patch_oracle_package(|package| {
+        let xml = std::str::from_utf8(package.get_part(header_part).expect("oracle header part"))
+            .unwrap()
+            .replace(r#"w:instr="PAGE""#, r#"w:instr="PAGE \* ROMAN""#);
+        package.set_part(header_part, xml.into_bytes());
+    });
+    assert_eq!(page_field_labels(&bytes), ["I", "XII", "XXVII"]);
+}

@@ -943,6 +943,9 @@ pub struct CT_Columns {
 pub struct CT_PageNumberType {
     /// Displayed page number at which this section starts.
     pub start: Option<u32>,
+    /// Page-number format (`w:fmt`) the section's PAGE fields display in.
+    /// Read from the source; an authored section writes only `start`.
+    pub format: Option<crate::numbering::ST_NumberFormat>,
     /// Original `w:pgNumType` subtree, including unsupported attributes.
     #[doc(hidden)]
     pub raw_xml: Option<Vec<u8>>,
@@ -965,6 +968,7 @@ impl CT_PageNumberType {
     pub fn new(start: u32) -> Self {
         Self {
             start: Some(start),
+            format: None,
             raw_xml: None,
             parsed_start: None,
             start_attribute_name: None,
@@ -2084,9 +2088,15 @@ impl CT_SectPr {
         raw_xml: Vec<u8>,
     ) -> Result<CT_PageNumberType> {
         let mut start = None;
+        let mut format = None;
         let mut start_attribute_name = None;
         for attr in e.attributes() {
             let attr = attr?;
+            if is_word_attribute(attr.key.as_ref(), b"fmt", word_prefixes) {
+                format = Some(crate::numbering::ST_NumberFormat::from_str(
+                    &attr.decoded_and_normalized_value(XmlVersion::Implicit1_0, e.decoder())?,
+                ));
+            }
             if is_word_attribute(attr.key.as_ref(), b"start", word_prefixes) {
                 start = attr
                     .decoded_and_normalized_value(XmlVersion::Implicit1_0, e.decoder())?
@@ -2128,6 +2138,7 @@ impl CT_SectPr {
         reserved_insertion_prefixes.dedup();
         Ok(CT_PageNumberType {
             start,
+            format,
             raw_xml: Some(raw_xml),
             parsed_start: start,
             start_attribute_name,
